@@ -9,7 +9,11 @@ enum EstadoLink : uint8_t {
   LINK_DESCONECTADO, LINK_CONECTANDO, LINK_CONFIGURANDO, LINK_SEM_ECU, LINK_ONLINE
 };
 
-enum QId : uint8_t { Q_VEL, Q_RPM, Q_CARGA, Q_MAF, Q_MAP, Q_TEMP, Q_IAT, Q_ACEL, Q_VOLT, Q_N };
+enum QId : uint8_t {
+  Q_VEL, Q_RPM, Q_CARGA, Q_MAF, Q_MAP, Q_TEMP, Q_IAT, Q_ACEL,
+  Q_STFT, Q_LTFT,      // ajuste de mistura: curto prazo (06) e longo prazo (07)
+  Q_VOLT, Q_N
+};
 
 struct Consulta {
   const char* cmd;
@@ -32,9 +36,17 @@ struct Celula {
   uint8_t datum;         // alinhamento do valor (0 = TL_DATUM)
 };
 
+// Barra vertical com degrade: cada linha da barra tem a cor correspondente
+// ao valor que ela representa (corFn recebe o valor e devolve a cor RGB565).
 struct Barra {
   int16_t x, y, w, h;
-  float t1, t2;          // marcas (fracao 0..1) dos limites de cor
-  int16_t ultAlt;
-  uint16_t ultCor;
+  float vmin, vmax;              // escala da barra
+  uint16_t (*corFn)(float);
+  int16_t ultAlt;                // altura (em pixels) atualmente desenhada
+};
+
+// Valor suavizado para exibicao (animacao dos numeros e das barras).
+struct Suave {
+  float v;
+  bool  ok;                      // false = proxima leitura entra direto, sem animar
 };

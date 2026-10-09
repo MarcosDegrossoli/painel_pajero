@@ -5,10 +5,13 @@
  *
  * Paginas:
  *   0 = VIAGEM      (distancia, tempos, medias, ritmo, consumo, litros, carga media)
- *   1 = OFF-ROAD    (barras de carga e temperatura, RPM, bateria, extras)
+ *   1 = OFF-ROAD    (barras de carga e temperatura, RPM, bateria, mistura, extras)
  *
  * Toque curto : troca de pagina
  * Toque longo : (2 s) zera a viagem (pagina 0) ou os picos da sessao (pagina 1)
+ *
+ * Cores: todas as faixas usam degrade verde -> amarelo -> vermelho.
+ *        Os pontos de cada degrade ficam nas constantes logo abaixo.
  *
  * Arquitetura:
  *   - Tarefa FreeRTOS "obd" (core 0): Bluetooth, comandos AT, consultas PID.
@@ -36,9 +39,11 @@
 uint8_t mac_elm[6] = {0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33};
 
 // --- Tanque -----------------------------------------------------------
+// Degrade dos litros usados: verde ate 50%, amarelo em 70%, vermelho a partir de 85%
 const float TANQUE_L               = 53.0f;
-const float TANQUE_ALERTA_AMARELO  = 0.70f;   // 70% usado (~37 L)
-const float TANQUE_ALERTA_VERMELHO = 0.85f;   // 85% usado (~45 L, sobram ~8 L)
+const float TANQUE_VERDE_ATE       = 0.50f;   // ~26,5 L
+const float TANQUE_ALERTA_AMARELO  = 0.70f;   // ~37 L
+const float TANQUE_ALERTA_VERMELHO = 0.85f;   // ~45 L (sobram ~8 L)
 
 // --- Estimativa de consumo (so usada se o carro NAO tiver MAF, PID 0110)
 // Metodo "speed-density": calcula o ar pela pressao do coletor (MAP).
@@ -48,20 +53,38 @@ const float AFR                 = 14.7f;   // relacao ar/combustivel (gasolina p
 const float DENSIDADE_G_L       = 745.0f;  // g/L da gasolina
 const float FATOR_CALIB_CONSUMO = 1.00f;   // multiplicador final (calibre apos abastecer)
 
+// --- Consumo (km/L): verde acima de 7,5 / amarelo em 6,5 / vermelho a 5,5 ou menos
+const float CONSUMO_VERDE    = 7.5f;
+const float CONSUMO_AMARELO  = 6.5f;
+const float CONSUMO_VERMELHO = 5.5f;
+
 // --- Carga do motor (%) ---
-const int CARGA_AMARELO  = 71;   // >= 71 amarelo
-const int CARGA_VERMELHO = 85;   // >= 85 vermelho
+const float CARGA_VERDE    = 70.0f;   // ate aqui: verde
+const float CARGA_AMARELO  = 77.5f;   // amarelo puro
+const float CARGA_VERMELHO = 85.0f;   // a partir daqui: vermelho
 
 // --- Temperatura do liquido (C) ---
-const int TEMP_FRIO     = 70;    // abaixo: azul (motor ainda aquecendo)
-const int TEMP_AMARELO  = 100;   // >= 100 amarelo
-const int TEMP_VERMELHO = 105;   // >= 105 vermelho + LED + aviso
-const int TEMP_MIN_BARRA = 40;   // escala da barra
-const int TEMP_MAX_BARRA = 120;
+const float TEMP_FRIO     = 70.0f;    // abaixo: azul (motor ainda aquecendo)
+const float TEMP_VERDE    = 95.0f;    // ate aqui: verde
+const float TEMP_AMARELO  = 102.0f;   // amarelo puro
+const float TEMP_VERMELHO = 108.0f;   // a partir daqui: vermelho
+const float TEMP_ALARME   = 108.0f;   // "TEMP ALTA!" no topo + LED piscando
+const float TEMP_MIN_BARRA = 40.0f;   // escala da barra
+const float TEMP_MAX_BARRA = 120.0f;
 
 // --- RPM ---
-const int RPM_AMARELO  = 4500;
-const int RPM_VERMELHO = 5500;
+const float RPM_VERDE    = 3500.0f;
+const float RPM_AMARELO  = 4500.0f;
+const float RPM_VERMELHO = 5500.0f;
+
+// --- Ajuste de mistura (soma curto + longo prazo, em %, valor absoluto) ---
+const float TRIM_VERDE    = 5.0f;
+const float TRIM_AMARELO  = 10.0f;
+const float TRIM_VERMELHO = 15.0f;
+
+// --- Suavizacao da pagina 2 (constante de tempo, em segundos; maior = mais suave/lento) ---
+const float TAU_UI_RAPIDO_S = 0.30f;   // RPM, velocidade, carga, acelerador
+const float TAU_UI_LENTO_S  = 0.80f;   // temperaturas, bateria, mistura
 
 // --- Viagem ---
 const float VEL_MOVIMENTO_KMH = 3.0f;       // acima disso conta como "em movimento"
@@ -101,10 +124,10 @@ volatile uint8_t paginaAtual = 0;
 
 struct Dados {
   volatile float vel = 0, rpm = 0, carga = 0, temp = 0, acel = 0, iat = 0;
-  volatile float mapKpa = 0, maf = 0, volt = 0;
+  volatile float mapKpa = 0, maf = 0, volt = 0, stft = 0, ltft = 0;
   // millis() da ultima leitura valida (0 = nunca)
   volatile uint32_t tVel = 0, tRpm = 0, tCarga = 0, tTemp = 0, tAcel = 0, tIat = 0;
-  volatile uint32_t tMap = 0, tMaf = 0, tVolt = 0;
+  volatile uint32_t tMap = 0, tMaf = 0, tVolt = 0, tStft = 0, tLtft = 0;
 } d;
 
 inline bool fresco(uint32_t t, uint32_t idade = 4000) {
@@ -115,8 +138,7 @@ inline bool fresco(uint32_t t, uint32_t idade = 4000) {
 //  OBD / ELM327  (roda na tarefa "obd")
 // =====================================================================
 
-
-// A ORDEM deve ser a mesma do enum QId
+// A ORDEM deve ser a mesma do enum QId (tipos.h)
 Consulta consultas[Q_N] = {
   /* Q_VEL   */ {"010D", 0x0D,  500, false, true, 0, 0},
   /* Q_RPM   */ {"010C", 0x0C,  500, false, true, 0, 0},
@@ -126,6 +148,8 @@ Consulta consultas[Q_N] = {
   /* Q_TEMP  */ {"0105", 0x05, 2500, false, true, 0, 0},
   /* Q_IAT   */ {"010F", 0x0F, 5000, false, true, 0, 0},
   /* Q_ACEL  */ {"0111", 0x11, 1000, true,  true, 0, 0},
+  /* Q_STFT  */ {"0106", 0x06, 3000, true,  true, 0, 0},
+  /* Q_LTFT  */ {"0107", 0x07, 3000, true,  true, 0, 0},
   /* Q_VOLT  */ {"ATRV", 0x00, 2000, false, true, 0, 0},
 };
 
@@ -296,6 +320,12 @@ bool executaConsulta(QId id) {
     case Q_ACEL:
       if (!extrai(resp, q.pid, b, 1)) return false;
       d.acel = b[0] * 100.0f / 255.0f; d.tAcel = t; return true;
+    case Q_STFT:   // ajuste de mistura curto prazo: (A-128)*100/128 %
+      if (!extrai(resp, q.pid, b, 1)) return false;
+      d.stft = ((float)b[0] - 128.0f) * 100.0f / 128.0f; d.tStft = t; return true;
+    case Q_LTFT:   // ajuste de mistura longo prazo
+      if (!extrai(resp, q.pid, b, 1)) return false;
+      d.ltft = ((float)b[0] - 128.0f) * 100.0f / 128.0f; d.tLtft = t; return true;
     default: return false;
   }
 }
@@ -490,6 +520,57 @@ float velMediaMovel() {
 }
 
 // =====================================================================
+//  CORES (degrade verde -> amarelo -> vermelho)
+// =====================================================================
+
+// x0 = valor em que a cor ainda e verde, x1 = valor do amarelo puro,
+// x2 = valor em que fica vermelho. Funciona nos dois sentidos
+// (x0 < x1 < x2 para "quanto maior pior"; x0 > x1 > x2 para "quanto menor pior").
+uint16_t corGradiente(float val, float x0, float x1, float x2) {
+  float r, g;
+  float u = (val - x0) / (x1 - x0);
+  if (u <= 0.0f) {
+    r = 0; g = 255;
+  } else if (u < 1.0f) {
+    r = 255.0f * u; g = 255;
+  } else {
+    float w = (val - x1) / (x2 - x1);
+    if (w >= 1.0f) { r = 255; g = 0; }
+    else           { r = 255; g = 255.0f * (1.0f - w); }
+  }
+  return tft.color565((uint8_t)r, (uint8_t)g, 0);
+}
+
+uint16_t corCarga(float pct) { return corGradiente(pct, CARGA_VERDE, CARGA_AMARELO, CARGA_VERMELHO); }
+
+uint16_t corTemp(float t) {
+  if (t < TEMP_FRIO) return COR_AZUL;
+  return corGradiente(t, TEMP_VERDE, TEMP_AMARELO, TEMP_VERMELHO);
+}
+
+uint16_t corRpm(float rpm) { return corGradiente(rpm, RPM_VERDE, RPM_AMARELO, RPM_VERMELHO); }
+
+uint16_t corConsumo(float kml) { return corGradiente(kml, CONSUMO_VERDE, CONSUMO_AMARELO, CONSUMO_VERMELHO); }
+
+uint16_t corTrim(float somaPct) {
+  return corGradiente(fabsf(somaPct), TRIM_VERDE, TRIM_AMARELO, TRIM_VERMELHO);
+}
+
+uint16_t corLitros(float litros) {
+  return corGradiente(litros, TANQUE_L * TANQUE_VERDE_ATE,
+                      TANQUE_L * TANQUE_ALERTA_AMARELO, TANQUE_L * TANQUE_ALERTA_VERMELHO);
+}
+
+// Tensao: faixa boa no meio; degrade para os dois lados (baixa e alta demais)
+uint16_t corTensao(float volt, bool motorLigado) {
+  if (motorLigado) {
+    if (volt < 14.0f) return corGradiente(volt, 13.2f, 12.7f, 12.2f);   // alternador fraco
+    return corGradiente(volt, 14.8f, 15.1f, 15.5f);                     // sobretensao
+  }
+  return corGradiente(volt, 12.5f, 12.1f, 11.7f);                       // bateria descarregando
+}
+
+// =====================================================================
 //  UI - helpers
 // =====================================================================
 
@@ -517,87 +598,71 @@ void limpaCache(Celula& c) { c.ult[0] = 0; c.ultCor = 0; }
 // ---- Pagina 1 (viagem): grade 2 colunas x 5 linhas ----
 // campos: x, y, w, yVal, fonteVal, rotulo, fonteRot, ult, ultCor, datum
 Celula p1[10] = {
-  {  4,  20, 152, 16, 4, "DISTANCIA km",    2, "", 0, 0},
-  {164,  20, 152, 16, 4, "TEMPO TOTAL",     2, "", 0, 0},
-  {  4,  64, 152, 16, 4, "TEMPO MOVIM.",    2, "", 0, 0},
-  {164,  64, 152, 16, 4, "VEL MEDIA km/h",  2, "", 0, 0},
-  {  4, 108, 152, 16, 4, "RITMO MED /10km", 2, "", 0, 0},
-  {164, 108, 152, 16, 4, "RITMO INS /10km", 2, "", 0, 0},
-  {  4, 152, 152, 16, 4, "CONSUMO INS km/L",2, "", 0, 0},
-  {164, 152, 152, 16, 4, "CONSUMO MED km/L",2, "", 0, 0},
-  {  4, 196, 152, 16, 4, "LITROS USADOS",   2, "", 0, 0},
-  {164, 196, 152, 16, 4, "CARGA MEDIA %",   2, "", 0, 0},
+  {  4,  20, 152, 16, 4, "DISTANCIA km",     2, "", 0, 0},   // 0
+  {164,  20, 152, 16, 4, "TEMPO TOTAL",      2, "", 0, 0},   // 1
+  {  4,  64, 152, 16, 4, "VEL MEDIA km/h",   2, "", 0, 0},   // 2
+  {164,  64, 152, 16, 4, "TEMPO MOVIM.",     2, "", 0, 0},   // 3
+  {  4, 108, 152, 16, 4, "RITMO MED /10km",  2, "", 0, 0},   // 4
+  {164, 108, 152, 16, 4, "RITMO INS /10km",  2, "", 0, 0},   // 5
+  {  4, 152, 152, 16, 4, "CONSUMO MED km/L", 2, "", 0, 0},   // 6
+  {164, 152, 152, 16, 4, "CONSUMO INS km/L", 2, "", 0, 0},   // 7
+  {  4, 196, 152, 16, 4, "LITROS USADOS",    2, "", 0, 0},   // 8
+  {164, 196, 152, 16, 4, "CARGA MEDIA %",    2, "", 0, 0},   // 9
 };
 
-// ---- Pagina 2 (off-road) ----
-Celula p2Rpm  = {120, 20, 196, 18, 7, "ROTACAO RPM", 2, "", 0, 0};
-Celula p2Bat  = {120, 92, 196, 18, 7, "BATERIA V",   2, "", 0, 0};
-Celula p2Vel  = {120, 164,  96, 10, 4, "VELOCIDADE km/h", 1, "", 0, 0};
-Celula p2Acel = {220, 164,  96, 10, 4, "ACELERADOR %",    1, "", 0, 0};
-Celula p2Iat  = {120, 202,  96, 10, 4, "AR ADMISSAO C",   1, "", 0, 0};
-Celula p2Pico = {220, 202,  96, 10, 4, "PICO TEMP C",     1, "", 0, 0};
+// ---- Pagina 2 (off-road): barras a esquerda + grade 2x4 de dados iguais ----
+Celula p2Rpm   = {120,  20, 96, 18, 4, "RPM",         2, "", 0, 0};
+Celula p2Bat   = {220,  20, 96, 18, 4, "BATERIA V",   2, "", 0, 0};
+Celula p2Vel   = {120,  75, 96, 18, 4, "VELOC km/h",  2, "", 0, 0};
+Celula p2Acel  = {220,  75, 96, 18, 4, "ACELER. %",   2, "", 0, 0};
+Celula p2Iat   = {120, 130, 96, 18, 4, "AR ADM. C",   2, "", 0, 0};
+Celula p2Pico  = {220, 130, 96, 18, 4, "PICO TEMP",   2, "", 0, 0};
+Celula p2Trim  = {120, 185, 96, 18, 4, "MISTURA %",   2, "", 0, 0};
+Celula p2TrimD = {220, 185, 96, 20, 2, "CURTO/LONGO", 2, "", 0, 0};
 // valores sob as barras (centralizados)
-Celula p2CargaV = {29, 204, 54, 0, 4, nullptr, 2, "", 0, TC_DATUM};
-Celula p2TempV  = {87, 204, 54, 0, 4, nullptr, 2, "", 0, TC_DATUM};
+Celula p2CargaV = { 29, 204, 54, 0, 4, nullptr, 2, "", 0, TC_DATUM};
+Celula p2TempV  = { 87, 204, 54, 0, 4, nullptr, 2, "", 0, TC_DATUM};
 
-Barra barCarga = {  2, 38, 54, 160, 0.70f, 0.85f, -1, 0};
-Barra barTemp  = { 60, 38, 54, 160,
-                   (float)(TEMP_AMARELO  - TEMP_MIN_BARRA) / (TEMP_MAX_BARRA - TEMP_MIN_BARRA),
-                   (float)(TEMP_VERMELHO - TEMP_MIN_BARRA) / (TEMP_MAX_BARRA - TEMP_MIN_BARRA),
-                   -1, 0};
+Barra barCarga = {  2, 38, 54, 160, 0.0f, 100.0f, corCarga, 0};
+Barra barTemp  = { 60, 38, 54, 160, TEMP_MIN_BARRA, TEMP_MAX_BARRA, corTemp, 0};
 
 void desenhaMoldura(const Barra& b) {
   tft.drawRect(b.x, b.y, b.w, b.h, COR_ROT);
 }
 
-void atualizaBarra(Barra& b, float frac, uint16_t cor) {
+// Barra com degrade fixo: cada linha tem a cor do valor que representa.
+// Desenha/apaga so as linhas que mudaram (sem piscar).
+void atualizaBarra(Barra& b, float frac) {
   if (frac < 0) frac = 0;
   if (frac > 1) frac = 1;
   int16_t ih  = b.h - 2;
   int16_t alt = (int16_t)(frac * ih + 0.5f);
-  if (alt == b.ultAlt && cor == b.ultCor) return;
+  if (alt == b.ultAlt) return;
 
-  int16_t yInt = b.y + 1;
-  tft.fillRect(b.x + 1, yInt, b.w - 2, ih - alt, TFT_BLACK);
-  tft.fillRect(b.x + 1, yInt + ih - alt, b.w - 2, alt, cor);
-  // marcas dos limites
-  int16_t y1 = yInt + ih - (int16_t)(b.t1 * ih);
-  int16_t y2 = yInt + ih - (int16_t)(b.t2 * ih);
-  tft.drawFastHLine(b.x + 1, y1, b.w - 2, TFT_WHITE);
-  tft.drawFastHLine(b.x + 1, y2, b.w - 2, TFT_WHITE);
-  b.ultAlt = alt;
-  b.ultCor = cor;
-}
-
-// ---- cores por faixa ----
-uint16_t corCarga(int pct) {
-  if (pct >= CARGA_VERMELHO) return TFT_RED;
-  if (pct >= CARGA_AMARELO)  return TFT_YELLOW;
-  return TFT_GREEN;
-}
-
-uint16_t corTemp(float t) {
-  if (t >= TEMP_VERMELHO) return TFT_RED;
-  if (t >= TEMP_AMARELO)  return TFT_YELLOW;
-  if (t <  TEMP_FRIO)     return COR_AZUL;
-  return TFT_GREEN;
-}
-
-uint16_t corTensao(float volt, bool motorLigado) {
-  if (motorLigado) {
-    if (volt < 12.2f || volt > 15.0f) return TFT_RED;
-    if (volt < 13.2f) return TFT_YELLOW;     // alternador carregando pouco
-    return TFT_GREEN;
+  int16_t yBase = b.y + 1 + ih;     // linha logo abaixo da ultima linha util
+  if (alt > b.ultAlt) {
+    for (int16_t i = b.ultAlt; i < alt; i++) {
+      float val = b.vmin + ((float)i + 0.5f) / (float)ih * (b.vmax - b.vmin);
+      tft.drawFastHLine(b.x + 1, yBase - 1 - i, b.w - 2, b.corFn(val));
+    }
+  } else {
+    tft.fillRect(b.x + 1, yBase - b.ultAlt, b.w - 2, b.ultAlt - alt, TFT_BLACK);
   }
-  if (volt < 12.0f) return TFT_RED;
-  if (volt < 12.4f) return TFT_YELLOW;
-  return TFT_GREEN;
+  b.ultAlt = alt;
 }
 
-uint16_t corLitros(float litros) {
-  if (litros >= TANQUE_L * TANQUE_ALERTA_VERMELHO) return TFT_RED;
-  if (litros >= TANQUE_L * TANQUE_ALERTA_AMARELO)  return TFT_YELLOW;
-  return TFT_WHITE;
+// ---- suavizacao ----
+Suave sRpm, sBat, sVel, sAcel, sIat, sStft, sLtft, sCarga, sTemp;
+
+float suaviza(Suave& s, float alvo, float dt, float tau) {
+  if (!s.ok) { s.v = alvo; s.ok = true; }
+  else       { s.v += (alvo - s.v) * (1.0f - expf(-dt / tau)); }
+  return s.v;
+}
+
+void resetSuaves() {
+  Suave* todos[] = {&sRpm, &sBat, &sVel, &sAcel, &sIat, &sStft, &sLtft, &sCarga, &sTemp};
+  for (uint8_t i = 0; i < 9; i++) todos[i]->ok = false;
 }
 
 // ---- formatacao ----
@@ -686,16 +751,18 @@ void desenhaPagina() {
     tft.drawFastVLine(160, 18, 222, COR_GRADE);
     for (uint8_t r = 1; r < 5; r++) tft.drawFastHLine(0, 18 + r * 44 - 2, 320, COR_GRADE);
   } else {
-    Celula* cels[] = {&p2Rpm, &p2Bat, &p2Vel, &p2Acel, &p2Iat, &p2Pico, &p2CargaV, &p2TempV};
-    for (uint8_t i = 0; i < 8; i++) { limpaCache(*cels[i]); desenhaRotulo(*cels[i]); }
+    Celula* cels[] = {&p2Rpm, &p2Bat, &p2Vel, &p2Acel, &p2Iat, &p2Pico,
+                      &p2Trim, &p2TrimD, &p2CargaV, &p2TempV};
+    for (uint8_t i = 0; i < 10; i++) { limpaCache(*cels[i]); desenhaRotulo(*cels[i]); }
     tft.setTextDatum(TC_DATUM);
     tft.setTextPadding(0);
     tft.setTextColor(COR_ROT, TFT_BLACK);
     tft.drawString("CARGA", 29, 20, 2);
     tft.drawString("TEMP", 87, 20, 2);
-    barCarga.ultAlt = -1; barTemp.ultAlt = -1;
+    barCarga.ultAlt = 0; barTemp.ultAlt = 0;     // tela acabou de ser apagada
     desenhaMoldura(barCarga);
     desenhaMoldura(barTemp);
+    resetSuaves();
   }
 }
 
@@ -740,21 +807,23 @@ void desenhaPids() {
   tft.setTextDatum(TL_DATUM);
   tft.setTextPadding(0);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString("PIDs suportados", 10, 6, 4);
+  tft.drawString("PIDs suportados", 10, 4, 4);
 
   struct ItemPid { const char* nome; QId id; };
   const ItemPid itens[] = {
     {"Velocidade (010D)", Q_VEL}, {"Rotacao (010C)", Q_RPM}, {"Carga motor (0104)", Q_CARGA},
     {"Temp. liquido (0105)", Q_TEMP}, {"Ar admissao (010F)", Q_IAT}, {"Acelerador (0111)", Q_ACEL},
+    {"Ajuste mistura (0106/07)", Q_STFT},
   };
-  int y = 40;
-  for (uint8_t i = 0; i < 6; i++) {
+  int y = 32;
+  for (uint8_t i = 0; i < 7; i++) {
     bool ok = consultas[itens[i].id].ativo;
+    if (itens[i].id == Q_STFT) ok = ok && consultas[Q_LTFT].ativo;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString(itens[i].nome, 10, y, 2);
     tft.setTextColor(ok ? TFT_GREEN : TFT_RED, TFT_BLACK);
     tft.drawString(ok ? "OK" : "NAO", 250, y, 2);
-    y += 20;
+    y += 19;
   }
   const char* fm = consultas[Q_MAF].ativo ? "MAF (medido)"
                  : consultas[Q_MAP].ativo ? "MAP (estimado)" : "INDISPONIVEL";
@@ -774,126 +843,177 @@ void desenhaPids() {
 void atualizaPagina1() {
   char s[20];
 
+  // linha 1: distancia | tempo total
   snprintf(s, sizeof(s), "%.1f", v.distKm);
   setCelula(p1[0], s, TFT_WHITE);
 
   fmtTempo(s, sizeof(s), v.tTotal);
   setCelula(p1[1], s, TFT_WHITE);
 
-  fmtTempo(s, sizeof(s), v.tMov);
-  setCelula(p1[2], s, TFT_WHITE);
-
+  // linha 2: velocidade media (sobre o tempo total) | tempo em movimento
   float vm = (v.tTotal > 10.0) ? (float)(v.distKm / (v.tTotal / 3600.0)) : 0.0f;
   snprintf(s, sizeof(s), "%.1f", vm);
+  setCelula(p1[2], s, TFT_WHITE);
+
+  fmtTempo(s, sizeof(s), v.tMov);
   setCelula(p1[3], s, TFT_WHITE);
 
+  // linha 3: ritmo medio | ritmo instantaneo (media movel)
   fmtRitmo(s, sizeof(s), vm);
   setCelula(p1[4], s, TFT_WHITE);
 
   fmtRitmo(s, sizeof(s), velMediaMovel());
   setCelula(p1[5], s, TFT_WHITE);
 
-  // consumo instantaneo / medio
+  // linha 4: consumo medio | consumo instantaneo (cores em degrade)
   if (!combustivelDisponivel()) {
     snprintf(s, sizeof(s), "N/D");
     setCelula(p1[6], s, COR_ROT);
     setCelula(p1[7], s, COR_ROT);
     setCelula(p1[8], s, COR_ROT);
   } else {
+    if (v.litros > 0.3 && v.distKm > 0.1) {
+      float med = (float)(v.distKm / v.litros);
+      if (med > 99.9f) med = 99.9f;
+      snprintf(s, sizeof(s), "%.1f", med);
+      setCelula(p1[6], s, corConsumo(med));
+    } else {
+      snprintf(s, sizeof(s), "--");
+      setCelula(p1[6], s, TFT_WHITE);
+    }
+
     if (emaInit && lhEma > 0.3f && velEma >= VEL_MOVIMENTO_KMH) {
       float kml = velEma / lhEma;
       if (kml > 99.9f) kml = 99.9f;
       snprintf(s, sizeof(s), "%.1f", kml);
+      setCelula(p1[7], s, corConsumo(kml));
     } else {
       snprintf(s, sizeof(s), "--");
+      setCelula(p1[7], s, TFT_WHITE);
     }
-    setCelula(p1[6], s, TFT_WHITE);
 
-    if (v.litros > 0.3 && v.distKm > 0.1) snprintf(s, sizeof(s), "%.1f", (float)(v.distKm / v.litros));
-    else snprintf(s, sizeof(s), "--");
-    setCelula(p1[7], s, TFT_WHITE);
-
+    // linha 5 (esquerda): litros usados
     snprintf(s, sizeof(s), "%.1f", (float)v.litros);
     setCelula(p1[8], s, corLitros((float)v.litros));
   }
 
-  // carga media do trajeto
+  // linha 5 (direita): carga media do trajeto
   if (v.tCarga > 5.0) {
-    int pct = (int)lroundf((float)(v.cargaInt / v.tCarga));
-    snprintf(s, sizeof(s), "%d", pct);
-    setCelula(p1[9], s, corCarga(pct));
+    float media = (float)(v.cargaInt / v.tCarga);
+    snprintf(s, sizeof(s), "%d", (int)lroundf(media));
+    setCelula(p1[9], s, corCarga(media));
   } else {
     snprintf(s, sizeof(s), "--");
     setCelula(p1[9], s, TFT_WHITE);
   }
 }
 
-void atualizaPagina2() {
+void atualizaPagina2(float dt) {
   char s[16];
   bool okRpm = fresco(d.tRpm);
   bool motor = okRpm && d.rpm > 300;
 
-  // RPM (destaque)
-  uint16_t cor = TFT_WHITE;
+  // RPM
   if (okRpm) {
-    snprintf(s, sizeof(s), "%d", (int)(d.rpm + 0.5f));
-    if (d.rpm >= RPM_VERMELHO) cor = TFT_RED;
-    else if (d.rpm >= RPM_AMARELO) cor = TFT_YELLOW;
-  } else snprintf(s, sizeof(s), "--");
-  setCelula(p2Rpm, s, cor);
-
-  // Bateria (destaque)
-  if (fresco(d.tVolt, 8000)) {
-    snprintf(s, sizeof(s), "%.1f", d.volt);
-    setCelula(p2Bat, s, corTensao(d.volt, motor));
+    float r = suaviza(sRpm, d.rpm, dt, TAU_UI_RAPIDO_S);
+    snprintf(s, sizeof(s), "%d", (int)(r + 0.5f));
+    setCelula(p2Rpm, s, corRpm(r));
   } else {
-    snprintf(s, sizeof(s), "--");
-    setCelula(p2Bat, s, TFT_WHITE);
+    sRpm.ok = false;
+    setCelula(p2Rpm, "--", TFT_WHITE);
+  }
+
+  // Bateria
+  if (fresco(d.tVolt, 8000)) {
+    float b = suaviza(sBat, d.volt, dt, TAU_UI_LENTO_S);
+    snprintf(s, sizeof(s), "%.1f", b);
+    setCelula(p2Bat, s, corTensao(b, motor));
+  } else {
+    sBat.ok = false;
+    setCelula(p2Bat, "--", TFT_WHITE);
   }
 
   // Barra de carga
   if (fresco(d.tCarga)) {
-    int pct = (int)lroundf(d.carga);
-    uint16_t c = corCarga(pct);
-    atualizaBarra(barCarga, pct / 100.0f, c);
-    snprintf(s, sizeof(s), "%d%%", pct);
-    setCelula(p2CargaV, s, c);
+    float c = suaviza(sCarga, d.carga, dt, TAU_UI_RAPIDO_S);
+    atualizaBarra(barCarga, c / 100.0f);
+    snprintf(s, sizeof(s), "%d%%", (int)lroundf(c));
+    setCelula(p2CargaV, s, corCarga(c));
   } else {
-    atualizaBarra(barCarga, 0, TFT_DARKGREY);
-    snprintf(s, sizeof(s), "--");
-    setCelula(p2CargaV, s, TFT_WHITE);
+    sCarga.ok = false;
+    atualizaBarra(barCarga, 0);
+    setCelula(p2CargaV, "--", TFT_WHITE);
   }
 
   // Barra de temperatura
   if (fresco(d.tTemp, 8000)) {
-    uint16_t c = corTemp(d.temp);
-    float frac = (d.temp - TEMP_MIN_BARRA) / (float)(TEMP_MAX_BARRA - TEMP_MIN_BARRA);
-    atualizaBarra(barTemp, frac, c);
-    snprintf(s, sizeof(s), "%d", (int)lroundf(d.temp));
-    setCelula(p2TempV, s, c);
+    float t = suaviza(sTemp, d.temp, dt, TAU_UI_LENTO_S);
+    atualizaBarra(barTemp, (t - TEMP_MIN_BARRA) / (TEMP_MAX_BARRA - TEMP_MIN_BARRA));
+    snprintf(s, sizeof(s), "%d", (int)lroundf(t));
+    setCelula(p2TempV, s, corTemp(t));
   } else {
-    atualizaBarra(barTemp, 0, TFT_DARKGREY);
-    snprintf(s, sizeof(s), "--");
-    setCelula(p2TempV, s, TFT_WHITE);
+    sTemp.ok = false;
+    atualizaBarra(barTemp, 0);
+    setCelula(p2TempV, "--", TFT_WHITE);
   }
 
-  // Secundarios
-  if (fresco(d.tVel)) snprintf(s, sizeof(s), "%d", (int)(d.vel + 0.5f)); else snprintf(s, sizeof(s), "--");
-  setCelula(p2Vel, s, TFT_WHITE);
+  // Velocidade
+  if (fresco(d.tVel)) {
+    float vv = suaviza(sVel, d.vel, dt, TAU_UI_RAPIDO_S);
+    snprintf(s, sizeof(s), "%d", (int)(vv + 0.5f));
+    setCelula(p2Vel, s, TFT_WHITE);
+  } else {
+    sVel.ok = false;
+    setCelula(p2Vel, "--", TFT_WHITE);
+  }
 
-  if (fresco(d.tAcel, 6000)) snprintf(s, sizeof(s), "%d", (int)lroundf(d.acel)); else snprintf(s, sizeof(s), "--");
-  setCelula(p2Acel, s, TFT_WHITE);
+  // Acelerador
+  if (fresco(d.tAcel, 6000)) {
+    float a = suaviza(sAcel, d.acel, dt, TAU_UI_RAPIDO_S);
+    snprintf(s, sizeof(s), "%d", (int)lroundf(a));
+    setCelula(p2Acel, s, TFT_WHITE);
+  } else {
+    sAcel.ok = false;
+    setCelula(p2Acel, "--", TFT_WHITE);
+  }
 
-  if (fresco(d.tIat, 15000)) snprintf(s, sizeof(s), "%d", (int)lroundf(d.iat)); else snprintf(s, sizeof(s), "--");
-  setCelula(p2Iat, s, TFT_WHITE);
+  // Temperatura do ar de admissao
+  if (fresco(d.tIat, 15000)) {
+    float i = suaviza(sIat, d.iat, dt, TAU_UI_LENTO_S);
+    snprintf(s, sizeof(s), "%d", (int)lroundf(i));
+    setCelula(p2Iat, s, TFT_WHITE);
+  } else {
+    sIat.ok = false;
+    setCelula(p2Iat, "--", TFT_WHITE);
+  }
 
-  if (picoTemp > -100) snprintf(s, sizeof(s), "%d", (int)lroundf(picoTemp)); else snprintf(s, sizeof(s), "--");
-  setCelula(p2Pico, s, picoTemp > -100 ? corTemp(picoTemp) : TFT_WHITE);
+  // Pico de temperatura da sessao
+  if (picoTemp > -100) {
+    snprintf(s, sizeof(s), "%d", (int)lroundf(picoTemp));
+    setCelula(p2Pico, s, corTemp(picoTemp));
+  } else {
+    setCelula(p2Pico, "--", TFT_WHITE);
+  }
+
+  // Ajuste de mistura: soma (curto + longo) e, ao lado, cada um
+  if (fresco(d.tStft, 10000) && fresco(d.tLtft, 10000)) {
+    float cu = suaviza(sStft, d.stft, dt, TAU_UI_LENTO_S);
+    float lo = suaviza(sLtft, d.ltft, dt, TAU_UI_LENTO_S);
+    float soma = cu + lo;
+    snprintf(s, sizeof(s), "%+.1f", soma);
+    setCelula(p2Trim, s, corTrim(soma));
+    snprintf(s, sizeof(s), "%+.1f/%+.1f", cu, lo);
+    setCelula(p2TrimD, s, COR_ROT);
+  } else {
+    sStft.ok = false; sLtft.ok = false;
+    setCelula(p2Trim, "--", TFT_WHITE);
+    setCelula(p2TrimD, "--", COR_ROT);
+  }
 }
 
 // ---- alarme (temperatura) ----
 void atualizaAlarme(uint32_t agora) {
-  alarmeTemp = fresco(d.tTemp, 8000) && d.temp >= TEMP_VERMELHO;
+  alarmeTemp = fresco(d.tTemp, 8000) && d.temp >= TEMP_ALARME;
   bool piscaOn = alarmeTemp && ((agora / 400) % 2 == 0);
   digitalWrite(LED_R, piscaOn ? LOW : HIGH);
 }
@@ -1024,9 +1144,15 @@ void loop() {
     if (sujo) salvaViagem();
   }
 
+  // intervalo entre quadros (para a suavizacao da pagina 2)
+  static uint32_t tQuadroAnt = 0;
+  float dt = (agora - tQuadroAnt) / 1000.0f;
+  tQuadroAnt = agora;
+  if (dt > 0.25f) dt = 0.25f;
+
   atualizaHeader();
   if (paginaAtual == 0) atualizaPagina1();
-  else                  atualizaPagina2();
+  else                  atualizaPagina2(dt);
 
   delay(20);
 }
