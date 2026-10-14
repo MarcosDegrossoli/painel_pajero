@@ -31,7 +31,7 @@ struct Celula {
   uint8_t fonteVal;
   const char* rotulo;    // nullptr = sem rotulo
   uint8_t fonteRot;
-  char ult[16];          // ultimo texto desenhado
+  char ult[32];          // ultimo texto desenhado (ate 31 caracteres)
   uint16_t ultCor;
   uint8_t datum;         // alinhamento do valor (0 = TL_DATUM)
 };

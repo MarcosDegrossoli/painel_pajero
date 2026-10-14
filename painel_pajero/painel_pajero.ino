@@ -6,9 +6,12 @@
  * Paginas:
  *   0 = VIAGEM      (distancia, tempos, medias, ritmo, consumo, litros, carga media)
  *   1 = OFF-ROAD    (barras de carga e temperatura, RPM, bateria, mistura, extras)
+ *   2 = ECO         (mapa carga x RPM com curva alvo, orientacao do pedal, barras de
+ *                    consumo em L/100 km, marcha estimada e escorregamento do conversor)
  *
  * Toque curto : troca de pagina
- * Toque longo : (2 s) zera a viagem (pagina 0) ou os picos da sessao (pagina 1)
+ * Toque longo : (2 s) zera a viagem (pagina 0), os picos da sessao (pagina 1)
+ *               ou a estatistica "tempo na faixa" (pagina 2)
  *
  * Cores: todas as faixas usam degrade verde -> amarelo -> vermelho.
  *        Os pontos de cada degrade ficam nas constantes logo abaixo.
@@ -99,6 +102,40 @@ const uint32_t TOQUE_LONGO_MS     = 2000;
 const float TAU_CONSUMO_S = 10.0f;          // suavizacao do consumo instantaneo
 const uint8_t JANELA_RITMO_S = 30;          // media movel do ritmo (segundos)
 
+// --- Pagina ECO -------------------------------------------------------
+// Mapa: eixo X = RPM, eixo Y = carga do motor. A CURVA ALVO e a carga recomendada para cada RPM
+// (carga media-alta com giro baixo-medio) e a faixa verde e a curva +- ECO_FAIXA_PCT.
+// ATENCAO: ponto de partida baseado em como motores a gasolina aspirados costumam se comportar.
+// Ainda nao foi validado com dados de estrada da TR4; refine com os CSV.
+const uint8_t ECO_CURVA_N = 6;
+const float ECO_CURVA_RPM[ECO_CURVA_N]   = {  800, 1500, 2000, 2800, 3500, 4600};
+const float ECO_CURVA_CARGA[ECO_CURVA_N] = {   50,   62,   68,   72,   70,   66};
+const float ECO_FAIXA_PCT        = 12.0f;   // largura da faixa verde (+- pontos de carga)
+const float ECO_CARGA_ENRIQ      = 85.0f;   // acima disso a ECU tende a enriquecer a mistura
+const float ECO_TPS_ALTO         = 60.0f;   // pedal acima disso = risco de kickdown
+const float ECO_RPM_CRUZEIRO_MAX = 2200.0f; // carga baixa ate este giro = cruzeiro leve (tudo bem)
+const float ECO_ROLANDO_VEL_MIN  = 15.0f;   // pedal fora acima disso = "rolando"
+const float ECO_RPM_MIN = 600.0f,  ECO_RPM_MAX = 4600.0f;     // escala do mapa
+const float ECO_CARGA_MIN = 10.0f, ECO_CARGA_MAX = 100.0f;
+const float ECO_BARRA_MAX_L100   = 30.0f;   // fundo de escala das barras de consumo
+const float ECO_TAU_FLUXO_S      = 2.0f;    // suavizacao do consumo instantaneo (calculo)
+const float ECO_TAU_CONS_UI_S    = 0.8f;    // suavizacao do movimento da barra de consumo instantaneo
+// Conversor de torque: RPM por km/h com o conversor TRAVADO em cada marcha.
+// Valores iniciais ESTIMADOS a partir do seu 1o CSV (que so chegou a 39 km/h): 1a ~98, 2a ~52, 3a ~34.
+// A 4a (24) e um palpite. Com um CSV de estrada (60-100 km/h constantes) eu ajusto esta tabela.
+const uint8_t ECO_N_MARCHAS = 4;
+const float ECO_RV_MARCHA[ECO_N_MARCHAS] = {98.0f, 52.0f, 34.0f, 24.0f};
+const float ECO_RV_TOLERANCIA = 1.08f;      // folga na tabela acima (velocidade em km/h inteiro, pneus, etc.)
+const float ECO_SLIP_VEL_MIN = 20.0f;       // so estima marcha/escorregamento acima disso...
+const float ECO_SLIP_TPS_MIN = 2.0f;        // ...e com o pedal pressionado (motor tracionando; com o pe fora o conversor "solta")
+const float ECO_SLIP_OK   = 6.0f;           // abaixo: travado (verde)
+const float ECO_SLIP_ALTO = 15.0f;          // acima: escorregando muito (vermelho)
+
+// --- Consumo -----------------------------------------------------------
+// true = soma os ajustes de mistura (curto + longo prazo) ao calculo: a ECU injeta
+// de fato (1 + trims) vezes o que o MAF sugere.
+const bool USAR_TRIMS_NO_CONSUMO = true;
+
 // --- Registro em cartao SD (CSV) ---
 const bool     LOG_ATIVO_CONFIG = true;     // false = nunca mexe no cartao
 const uint32_t LOG_INTERVALO_MS = 1000;     // uma linha por segundo (o ELM327 nao entrega mais rapido)
@@ -170,6 +207,7 @@ volatile bool semPromptUltimo = false;   // true = o ELM327 nem devolveu o ">" n
 volatile bool logPronto = false;         // true = cartao SD montado e registrando (aceleracao e mistura passam a ser lidas sempre)
 
 void setMsg(const char* t);              // definida mais abaixo (mensagem temporaria no cabecalho)
+void ecoDesenhaPaginaBase();             // definida na secao da pagina Eco
 
 struct Dados {
   volatile float vel = 0, rpm = 0, carga = 0, temp = 0, acel = 0, iat = 0;
@@ -361,7 +399,7 @@ int proximaConsulta() {
   for (uint8_t i = 0; i < Q_N; i++) {
     Consulta& q = consultas[i];
     if (!q.ativo) continue;
-    if (q.soPagina2 && paginaAtual != 1 && !logPronto) continue;   // registrando: le tudo sempre
+    if (q.soPagina2 && paginaAtual == 0 && !logPronto) continue;   // viagem sem registro: dispensa; Off-road, Eco e registro leem sempre
     float score = (float)(agora - q.ultima) / (float)q.intervalo;
     if (score >= melhorScore) { melhorScore = score; melhor = i; }
   }
@@ -595,6 +633,12 @@ float fluxoLh() {
   }
   if (isnan(maf)) return NAN;
   float lh = maf * 3600.0f / (AFR * DENSIDADE_G_L) * FATOR_CALIB_CONSUMO;
+  if (USAR_TRIMS_NO_CONSUMO && fresco(d.tStft, 10000) && fresco(d.tLtft, 10000)) {
+    float f = 1.0f + (d.stft + d.ltft) / 100.0f;
+    if (f < 0.85f) f = 0.85f;
+    if (f > 1.15f) f = 1.15f;
+    lh *= f;
+  }
   if (lh < 0) lh = 0;
   if (lh > 80) lh = 80;
   return lh;
@@ -708,9 +752,13 @@ bool logAbreArquivo() {
   if (logAberto) return true;
   if (!logPronto) return false;
   usaBusSD();
+  bool novo = !SD.exists(logNome);               // decide pelo nome, sem depender de size()
   logArq = SD.open(logNome, FILE_APPEND);
   if (!logArq) { logFalha("nao abriu o arquivo"); return false; }
-  if (logArq.size() == 0) logArq.print(LOG_CABECALHO);
+  if (novo || logArq.size() == 0) {
+    logArq.print(LOG_CABECALHO);
+    logArq.flush();                              // cabecalho em disco antes de qualquer dado
+  }
   logAberto = true;
   Serial.printf("Registro SD: gravando em %s\n", logNome);
   return true;
@@ -996,7 +1044,7 @@ void desenhaHeader() {
   tft.setTextDatum(TL_DATUM);
   tft.setTextPadding(0);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString(paginaAtual == 0 ? "VIAGEM" : "OFF-ROAD", 4, 1, 2);
+  tft.drawString(paginaAtual == 0 ? "VIAGEM" : (paginaAtual == 1 ? "OFF-ROAD" : "ECO"), 4, 1, 2);
 
   msgVisivel = (msgTxt[0] && millis() < msgAte);
   if (alarmeTemp) {
@@ -1017,7 +1065,7 @@ void desenhaHeader() {
   }
 
   tft.setTextColor(COR_ROT, TFT_BLACK);
-  tft.drawString(paginaAtual == 0 ? "1/2" : "2/2", 268, 1, 2);
+  tft.drawString(paginaAtual == 0 ? "1/3" : (paginaAtual == 1 ? "2/3" : "3/3"), 268, 1, 2);
   tft.fillCircle(308, 9, 6, corLink(estadoLink));
 
   headerEstado = estadoLink;
@@ -1042,6 +1090,9 @@ void desenhaPagina() {
     for (uint8_t i = 0; i < 10; i++) { limpaCache(p1[i]); desenhaRotulo(p1[i]); }
     tft.drawFastVLine(160, 18, 222, COR_GRADE);
     for (uint8_t r = 1; r < 5; r++) tft.drawFastHLine(0, 18 + r * 44 - 2, 320, COR_GRADE);
+  } else if (paginaAtual == 2) {
+    ecoDesenhaPaginaBase();
+    resetSuaves();
   } else {
     Celula* cels[] = {&p2Rpm, &p2Bat, &p2Vel, &p2Acel, &p2Iat, &p2Pico,
                       &p2Trim, &p2TrimD, &p2CargaV, &p2TempV};
@@ -1327,6 +1378,365 @@ void atualizaPagina2(float dt) {
   }
 }
 
+// =====================================================================
+//  PAGINA 3 - ECO
+// =====================================================================
+// Mapa carga x RPM com curva alvo, ponto atual com rastro, orientacao de uma palavra,
+// duas barras de consumo (L/100 km instantaneo suavizado e medio da viagem) e,
+// a direita, acelerador, marcha estimada, escorregamento do conversor e % do tempo na faixa.
+
+const int16_t MAPA_X = 2, MAPA_Y = 20, MAPA_W = 186, MAPA_H = 150;
+const uint16_t COR_ECO_FAIXA = 0x0180;   // verde escuro (faixa em torno da curva alvo)
+const uint16_t COR_ECO_VERM  = 0x3800;   // vermelho escuro (carga de enriquecimento)
+const uint16_t COR_ECO_CURVA = 0xAFF5;   // verde claro (curva alvo)
+
+enum : uint8_t {
+  ECO_SEM_DADOS, ECO_PARADO, ECO_ROLANDO, ECO_FAIXA, ECO_CRUZEIRO,
+  ECO_ALIVIE_POUCO, ECO_RPM_ALTO, ECO_ALIVIE
+};
+
+// --- dados suavizados da pagina (atualizados a cada quadro, com a pagina aberta ou nao) ---
+bool  ecoOk = false, ecoMotor = false, ecoTemMapa = false, ecoTemTps = false;
+float ecoRpm = 0, ecoCarga = 0, ecoTps = 0, ecoVel = 0;
+bool  ecoLhOk = false, ecoL100Ok = false;
+float ecoLhR = 0, ecoVelR = 0, ecoL100 = 0;
+float ecoSlip = 0;
+uint8_t ecoMarcha = 0;                  // 0 = desconhecida
+uint32_t ecoMarchaT = 0;                // quando a marcha foi estimada pela ultima vez
+uint8_t ecoEstado = ECO_SEM_DADOS;
+double  ecoTBom = 0, ecoTMov = 0;       // segundos "na faixa" e em movimento (so RAM)
+
+// --- geometria do mapa (calculada ao abrir a pagina) ---
+int16_t ecoCurvaY[MAPA_W];
+int16_t ecoBandaPx = 0, ecoYEnriq = 0;
+int16_t ecoGradeX[4], ecoGradeY[3];
+
+const uint8_t ECO_TRILHA = 10;           // pontos do rastro (1 a cada 250 ms)
+int16_t ecoTrX[ECO_TRILHA], ecoTrY[ECO_TRILHA];
+uint8_t ecoTrN = 0, ecoTrIni = 0;
+uint32_t ecoTrTempo = 0;
+int16_t ecoDotX = -1, ecoDotY = -1;
+
+Celula ecoOrient = {  4, 194, 312, 0, 4, nullptr, 2, "", 0, 0};
+Celula ecoDet    = {  4, 222, 312, 0, 2, nullptr, 2, "", 0, 0};
+Celula ecoInstV  = {204, 168,  30, 0, 2, nullptr, 2, "", 0, TC_DATUM};
+Celula ecoMedV   = {235, 168,  30, 0, 2, nullptr, 2, "", 0, TC_DATUM};
+Celula ecoAcel   = {258,  20,  60, 16, 4, "ACEL %",   2, "", 0, 0};
+Celula ecoMarchaC= {258,  63,  60, 16, 4, "MARCHA~",  2, "", 0, 0};
+Celula ecoSlipC  = {258, 106,  60, 16, 4, "SLIP %",   2, "", 0, 0};   // escorregamento do conversor
+Celula ecoFaixaC = {258, 149,  60, 16, 4, "FAIXA %",  2, "", 0, 0};
+
+// L/100 km: mesmas faixas do km/L da pagina de viagem (verde ate 13,3 / amarelo 15,4 / vermelho 18,2)
+uint16_t corL100(float l100) {
+  return corGradiente(l100, 100.0f / CONSUMO_VERDE, 100.0f / CONSUMO_AMARELO, 100.0f / CONSUMO_VERMELHO);
+}
+Barra barEcoInst = {191, 46, 26, 122, 0.0f, ECO_BARRA_MAX_L100, corL100, 0};
+Barra barEcoMed  = {222, 46, 26, 122, 0.0f, ECO_BARRA_MAX_L100, corL100, 0};
+
+static void ema(float& s, float x, float dt, float tau) {
+  s += (x - s) * (1.0f - expf(-dt / tau));
+}
+
+// Carga alvo (curva) para um RPM, por interpolacao linear entre os pontos da configuracao.
+float ecoCurvaAlvo(float rpm) {
+  if (rpm <= ECO_CURVA_RPM[0]) return ECO_CURVA_CARGA[0];
+  for (uint8_t i = 1; i < ECO_CURVA_N; i++) {
+    if (rpm <= ECO_CURVA_RPM[i]) {
+      float u = (rpm - ECO_CURVA_RPM[i - 1]) / (ECO_CURVA_RPM[i] - ECO_CURVA_RPM[i - 1]);
+      return ECO_CURVA_CARGA[i - 1] + u * (ECO_CURVA_CARGA[i] - ECO_CURVA_CARGA[i - 1]);
+    }
+  }
+  return ECO_CURVA_CARGA[ECO_CURVA_N - 1];
+}
+
+int16_t ecoX(float rpm) {
+  float f = (rpm - ECO_RPM_MIN) / (ECO_RPM_MAX - ECO_RPM_MIN);
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  return MAPA_X + 1 + (int16_t)(f * (MAPA_W - 3) + 0.5f);
+}
+
+int16_t ecoY(float carga) {
+  float f = (ECO_CARGA_MAX - carga) / (ECO_CARGA_MAX - ECO_CARGA_MIN);
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  return MAPA_Y + 1 + (int16_t)(f * (MAPA_H - 3) + 0.5f);
+}
+
+void ecoPreparaMapa() {
+  for (int16_t cx = 0; cx < MAPA_W; cx++) {
+    float f = (float)(cx - 1) / (float)(MAPA_W - 3);
+    if (f < 0) f = 0;
+    if (f > 1) f = 1;
+    ecoCurvaY[cx] = ecoY(ecoCurvaAlvo(ECO_RPM_MIN + f * (ECO_RPM_MAX - ECO_RPM_MIN)));
+  }
+  ecoBandaPx = (int16_t)(ECO_FAIXA_PCT / (ECO_CARGA_MAX - ECO_CARGA_MIN) * (MAPA_H - 3) + 0.5f);
+  ecoYEnriq = ecoY(ECO_CARGA_ENRIQ);
+  for (uint8_t i = 0; i < 4; i++) ecoGradeX[i] = ecoX(1000.0f * (i + 1));
+  ecoGradeY[0] = ecoY(25.0f); ecoGradeY[1] = ecoY(50.0f); ecoGradeY[2] = ecoY(75.0f);
+}
+
+// Cor do fundo do mapa num pixel da tela (usada para desenhar e para apagar o ponto/rastro).
+uint16_t corFundoEco(int16_t px, int16_t py) {
+  int16_t cx = px - MAPA_X;
+  if (cx <= 0 || cx >= MAPA_W - 1 || py <= MAPA_Y || py >= MAPA_Y + MAPA_H - 1) return COR_ROT;   // moldura
+  uint16_t c = TFT_BLACK;
+  if (py < ecoYEnriq) c = COR_ECO_VERM;
+  int16_t dy = py - ecoCurvaY[cx];
+  if (dy < 0) dy = -dy;
+  if (dy <= ecoBandaPx) c = COR_ECO_FAIXA;
+  for (uint8_t i = 0; i < 4; i++) if (px == ecoGradeX[i]) c = COR_GRADE;
+  for (uint8_t i = 0; i < 3; i++) if (py == ecoGradeY[i]) c = COR_GRADE;
+  if (dy <= 1) c = COR_ECO_CURVA;
+  return c;
+}
+
+// Redesenha o fundo de uma linha do mapa, entre as colunas x0 e x1 (agrupando pixels iguais).
+void ecoFundoLinha(int16_t py, int16_t x0, int16_t x1) {
+  int16_t ini = x0;
+  uint16_t cor = corFundoEco(x0, py);
+  for (int16_t px = x0 + 1; px <= x1; px++) {
+    uint16_t c = corFundoEco(px, py);
+    if (c != cor) { tft.drawFastHLine(ini, py, px - ini, cor); ini = px; cor = c; }
+  }
+  tft.drawFastHLine(ini, py, x1 - ini + 1, cor);
+}
+
+void ecoDesenhaFundo() {
+  for (int16_t py = MAPA_Y; py < MAPA_Y + MAPA_H; py++) ecoFundoLinha(py, MAPA_X, MAPA_X + MAPA_W - 1);
+}
+
+// Apaga uma area quadrada em volta de (cx, cy) restaurando o fundo.
+void ecoRestauraFundo(int16_t cx, int16_t cy, int16_t r) {
+  int16_t x0 = cx - r, x1 = cx + r;
+  if (x0 < MAPA_X) x0 = MAPA_X;
+  if (x1 > MAPA_X + MAPA_W - 1) x1 = MAPA_X + MAPA_W - 1;
+  for (int16_t py = cy - r; py <= cy + r; py++) {
+    if (py < MAPA_Y || py >= MAPA_Y + MAPA_H) continue;
+    ecoFundoLinha(py, x0, x1);
+  }
+}
+
+bool ecoEstadoBom(uint8_t e) { return e == ECO_ROLANDO || e == ECO_FAIXA || e == ECO_CRUZEIRO; }
+
+uint16_t ecoCorEstado(uint8_t e) {
+  switch (e) {
+    case ECO_ROLANDO: case ECO_FAIXA: case ECO_CRUZEIRO: return TFT_GREEN;
+    case ECO_ALIVIE_POUCO: case ECO_RPM_ALTO:            return TFT_YELLOW;
+    case ECO_ALIVIE:                                     return TFT_RED;
+    default:                                             return COR_ROT;
+  }
+}
+
+const char* ecoTextoEstado(uint8_t e) {
+  switch (e) {
+    case ECO_PARADO:       return "PARADO";
+    case ECO_ROLANDO:      return "ROLANDO";
+    case ECO_FAIXA:        return "NA FAIXA";
+    case ECO_CRUZEIRO:     return "CRUZEIRO";
+    case ECO_ALIVIE_POUCO: return "ALIVIE UM POUCO";
+    case ECO_RPM_ALTO:     return "RPM ALTO";
+    case ECO_ALIVIE:       return "ALIVIE O PEDAL";
+    default:               return "SEM DADOS";
+  }
+}
+
+// Atualiza (a cada quadro) os valores suavizados, o estado de orientacao e as estatisticas.
+void atualizaEco(float dt) {
+  ecoMotor   = fresco(d.tRpm) && d.rpm > 300;
+  ecoTemMapa = ecoMotor && fresco(d.tCarga);
+  ecoTemTps  = ecoMotor && fresco(d.tAcel, 6000);
+  if (!ecoMotor) { ecoOk = false; ecoLhOk = false; ecoL100Ok = false; ecoMarcha = 0; ecoEstado = ECO_SEM_DADOS; return; }
+
+  float vel = fresco(d.tVel) ? d.vel : 0.0f;
+  if (!ecoOk) {
+    ecoRpm = d.rpm; ecoCarga = d.carga; ecoTps = d.acel; ecoVel = vel; ecoSlip = 0;
+    ecoOk = true;
+  } else {
+    ema(ecoRpm, d.rpm, dt, TAU_UI_RAPIDO_S);
+    ema(ecoVel, vel, dt, TAU_UI_RAPIDO_S);
+    if (ecoTemMapa) ema(ecoCarga, d.carga, dt, TAU_UI_RAPIDO_S);
+    if (ecoTemTps)  ema(ecoTps, d.acel, dt, TAU_UI_RAPIDO_S);
+  }
+
+  // consumo instantaneo em L/100 km (abaixo de 5 km/h nao faz sentido)
+  float lh = fluxoLh();
+  if (!isnan(lh)) {
+    if (!ecoLhOk) { ecoLhR = lh; ecoVelR = vel; ecoLhOk = true; }
+    else { ema(ecoLhR, lh, dt, ECO_TAU_FLUXO_S); ema(ecoVelR, vel, dt, ECO_TAU_FLUXO_S); }
+  } else ecoLhOk = false;
+  if (ecoLhOk && ecoVelR >= 5.0f) {
+    float alvo = ecoLhR / ecoVelR * 100.0f;
+    if (!ecoL100Ok) { ecoL100 = alvo; ecoL100Ok = true; }
+    else ema(ecoL100, alvo, dt, ECO_TAU_CONS_UI_S);
+  } else ecoL100Ok = false;
+
+  // marcha estimada e escorregamento do conversor: RPM por km/h comparado com o do conversor travado
+  if (ecoVel >= ECO_SLIP_VEL_MIN && ecoTemTps && ecoTps >= ECO_SLIP_TPS_MIN) {
+    float rv = ecoRpm / ecoVel;
+    uint8_t g = ECO_N_MARCHAS - 1;
+    for (uint8_t i = 0; i < ECO_N_MARCHAS; i++) {
+      if (ECO_RV_MARCHA[i] <= rv * ECO_RV_TOLERANCIA) { g = i; break; }   // a marcha de relacao logo abaixo
+    }
+    float slip = (rv / ECO_RV_MARCHA[g] - 1.0f) * 100.0f;
+    if (slip < 0) slip = 0;
+    if (slip > 99) slip = 99;
+    if (ecoMarcha != g + 1) ecoSlip = slip;       // trocou de marcha: nao arrasta o valor anterior
+    else ema(ecoSlip, slip, dt, 1.0f);
+    ecoMarcha = g + 1;
+    ecoMarchaT = millis();
+  } else if (millis() - ecoMarchaT > 3000) {
+    ecoMarcha = 0;                                // fora das condicoes ha mais de 3 s: some
+  }
+
+  // estado de orientacao
+  uint8_t e;
+  if (!ecoTemMapa)                                              e = ECO_SEM_DADOS;
+  else if (ecoVel < 3.0f)                                       e = ECO_PARADO;
+  else if (ecoTemTps && ecoTps < 1.0f && ecoVel >= ECO_ROLANDO_VEL_MIN) e = ECO_ROLANDO;
+  else if (ecoCarga >= ECO_CARGA_ENRIQ || (ecoTemTps && ecoTps >= ECO_TPS_ALTO)) e = ECO_ALIVIE;
+  else {
+    float alvo = ecoCurvaAlvo(ecoRpm);
+    if (ecoCarga > alvo + ECO_FAIXA_PCT)        e = ECO_ALIVIE_POUCO;
+    else if (ecoCarga < alvo - ECO_FAIXA_PCT)   e = (ecoRpm <= ECO_RPM_CRUZEIRO_MAX) ? ECO_CRUZEIRO : ECO_RPM_ALTO;
+    else                                        e = ECO_FAIXA;
+  }
+  ecoEstado = e;
+
+  if (ecoVel >= 3.0f && e != ECO_SEM_DADOS) {
+    ecoTMov += dt;
+    if (ecoEstadoBom(e)) ecoTBom += dt;
+  }
+}
+
+// Ponto atual + rastro sobre o mapa (so redesenha quando algo mudou).
+void ecoAtualizaMapa() {
+  bool ok = ecoMotor && ecoTemMapa;
+  int16_t nx = -1, ny = -1;
+  if (ok) {
+    nx = ecoX(ecoRpm); ny = ecoY(ecoCarga);
+    // mantem o centro do ponto longe da moldura, para a argola (raio 4) nunca sair do mapa
+    if (nx < MAPA_X + 6) nx = MAPA_X + 6;
+    if (nx > MAPA_X + MAPA_W - 7) nx = MAPA_X + MAPA_W - 7;
+    if (ny < MAPA_Y + 6) ny = MAPA_Y + 6;
+    if (ny > MAPA_Y + MAPA_H - 7) ny = MAPA_Y + MAPA_H - 7;
+  }
+
+  uint32_t agora = millis();
+  bool novaAmostra = ok && (agora - ecoTrTempo >= 250);
+  if (!novaAmostra && nx == ecoDotX && ny == ecoDotY) return;
+
+  // apaga o rastro e o ponto antigos
+  for (uint8_t k = 0; k < ecoTrN; k++) {
+    uint8_t i = (ecoTrIni + k) % ECO_TRILHA;
+    ecoRestauraFundo(ecoTrX[i], ecoTrY[i], 2);
+  }
+  if (ecoDotX >= 0) ecoRestauraFundo(ecoDotX, ecoDotY, 4);
+
+  if (!ok) { ecoTrN = 0; ecoDotX = ecoDotY = -1; return; }
+
+  if (novaAmostra) {
+    ecoTrTempo = agora;
+    if (ecoTrN < ECO_TRILHA) {
+      uint8_t i = (ecoTrIni + ecoTrN) % ECO_TRILHA;
+      ecoTrX[i] = nx; ecoTrY[i] = ny; ecoTrN++;
+    } else {
+      ecoTrX[ecoTrIni] = nx; ecoTrY[ecoTrIni] = ny;
+      ecoTrIni = (ecoTrIni + 1) % ECO_TRILHA;
+    }
+  }
+  for (uint8_t k = 0; k < ecoTrN; k++) {          // do mais antigo (escuro) ao mais novo (claro)
+    uint8_t i = (ecoTrIni + k) % ECO_TRILHA;
+    uint8_t g = 70 + (uint8_t)(150 * (k + 1) / ECO_TRILHA);
+    tft.fillCircle(ecoTrX[i], ecoTrY[i], 1, tft.color565(g, g, g));
+  }
+  tft.fillCircle(nx, ny, 3, ecoCorEstado(ecoEstado) == COR_ROT ? TFT_WHITE : ecoCorEstado(ecoEstado));
+  tft.drawCircle(nx, ny, 4, TFT_WHITE);
+  ecoDotX = nx; ecoDotY = ny;
+}
+
+void ecoDesenhaPaginaBase() {
+  Celula* cels[] = {&ecoOrient, &ecoDet, &ecoInstV, &ecoMedV, &ecoAcel, &ecoMarchaC, &ecoSlipC, &ecoFaixaC};
+  for (uint8_t i = 0; i < 8; i++) { limpaCache(*cels[i]); desenhaRotulo(*cels[i]); }
+
+  ecoPreparaMapa();
+  ecoDesenhaFundo();
+  ecoTrN = 0; ecoTrIni = 0; ecoTrTempo = 0; ecoDotX = ecoDotY = -1;
+
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextPadding(0);
+  tft.setTextColor(COR_ROT, TFT_BLACK);
+  for (uint8_t i = 0; i < 4; i++) {                       // marcas de RPM sob o mapa
+    char s[6];
+    snprintf(s, sizeof(s), "%d", (i + 1) * 1000);
+    tft.drawString(s, ecoGradeX[i], MAPA_Y + MAPA_H + 3, 1);
+  }
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("L/100km", 191, 20, 2);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("INST", 204, 36, 1);
+  tft.drawString("MED", 235, 36, 1);
+
+  barEcoInst.ultAlt = 0; barEcoMed.ultAlt = 0;
+  desenhaMoldura(barEcoInst);
+  desenhaMoldura(barEcoMed);
+}
+
+void atualizaPaginaEco() {
+  char s[40];
+  ecoAtualizaMapa();
+
+  setCelula(ecoOrient, ecoTextoEstado(ecoEstado), ecoCorEstado(ecoEstado));
+
+  // barras de consumo (L/100 km): instantaneo (suavizado) e medio da viagem
+  if (ecoL100Ok) {
+    atualizaBarra(barEcoInst, ecoL100 / ECO_BARRA_MAX_L100);
+    snprintf(s, sizeof(s), "%.1f", ecoL100);
+    setCelula(ecoInstV, s, corL100(ecoL100));
+  } else {
+    atualizaBarra(barEcoInst, 0);
+    setCelula(ecoInstV, "--", TFT_WHITE);
+  }
+  if (combustivelDisponivel() && v.litros > 0.3 && v.distKm > 0.1) {
+    float med = (float)(v.litros / v.distKm * 100.0);
+    if (med > 99.9f) med = 99.9f;
+    atualizaBarra(barEcoMed, med / ECO_BARRA_MAX_L100);
+    snprintf(s, sizeof(s), "%.1f", med);
+    setCelula(ecoMedV, s, corL100(med));
+  } else {
+    atualizaBarra(barEcoMed, 0);
+    setCelula(ecoMedV, "--", TFT_WHITE);
+  }
+
+  // coluna da direita
+  if (ecoTemTps) { snprintf(s, sizeof(s), "%d", (int)lroundf(ecoTps)); setCelula(ecoAcel, s, TFT_WHITE); }
+  else           setCelula(ecoAcel, "--", TFT_WHITE);
+
+  if (ecoMarcha > 0) {
+    snprintf(s, sizeof(s), "%u", (unsigned)ecoMarcha);
+    setCelula(ecoMarchaC, s, TFT_WHITE);
+    snprintf(s, sizeof(s), "%d", (int)lroundf(ecoSlip));
+    // so colore a partir da 3a: nas marchas baixas o conversor escorrega por natureza
+    setCelula(ecoSlipC, s, ecoMarcha >= 3 ? corGradiente(ecoSlip, ECO_SLIP_OK, (ECO_SLIP_OK + ECO_SLIP_ALTO) / 2, ECO_SLIP_ALTO) : COR_ROT);
+  } else {
+    setCelula(ecoMarchaC, "--", TFT_WHITE);
+    setCelula(ecoSlipC, "--", COR_ROT);
+  }
+
+  if (ecoTMov > 20.0) {
+    float pct = (float)(ecoTBom / ecoTMov * 100.0);
+    snprintf(s, sizeof(s), "%d", (int)lroundf(pct));
+    setCelula(ecoFaixaC, s, corGradiente(pct, 70.0f, 50.0f, 30.0f));   // "quanto menor pior"
+  } else {
+    setCelula(ecoFaixaC, "--", TFT_WHITE);
+  }
+
+  if (ecoTemMapa) snprintf(s, sizeof(s), "RPM %d   CARGA %d%%   VEL %d",
+                           (int)lroundf(ecoRpm), (int)lroundf(ecoCarga), (int)lroundf(ecoVel));
+  else            snprintf(s, sizeof(s), "--");
+  setCelula(ecoDet, s, COR_ROT);
+}
+
 // ---- alarme (temperatura) ----
 void atualizaAlarme(uint32_t agora) {
   alarmeTemp = fresco(d.tTemp, 8000) && d.temp >= TEMP_ALARME;
@@ -1365,7 +1775,7 @@ void aoToqueCurto() {
     mudaPagina(0);
     return;
   }
-  mudaPagina((paginaAtual + 1) % 2);
+  mudaPagina((paginaAtual + 1) % 3);
 }
 
 void aoToqueLongo() {
@@ -1377,6 +1787,11 @@ void aoToqueLongo() {
     registraEvento("RESET_VIAGEM");   // a linha leva os totais finais (km e litros calculados) antes de zerar
     resetViagem();
     setMsg("VIAGEM ZERADA");
+  } else if (paginaAtual == 2) {
+    registraEvento("RESET_ECO");
+    ecoTBom = 0; ecoTMov = 0;
+    limpaCache(ecoFaixaC);
+    setMsg("ECO ZERADO");
   } else {
     registraEvento("RESET_PICOS");
     picoTemp = -999;
@@ -1518,9 +1933,11 @@ void loop() {
   tQuadroAnt = agora;
   if (dt > 0.25f) dt = 0.25f;
 
+  atualizaEco(dt);                 // sempre: alimenta a estatistica "tempo na faixa" mesmo com outra pagina aberta
   atualizaHeader();
-  if (paginaAtual == 0) atualizaPagina1();
-  else                  atualizaPagina2(dt);
+  if (paginaAtual == 0)      atualizaPagina1();
+  else if (paginaAtual == 1) atualizaPagina2(dt);
+  else                       atualizaPaginaEco();
 
   delay(20);
 }
